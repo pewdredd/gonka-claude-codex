@@ -1,0 +1,12 @@
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "key-is-in-.env",
+    "ANTHROPIC_MODEL": "zai-org/glm-5.3-flash",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "zai-org/glm-5.3-flash",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "zai-org/glm-5.3-flash",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "zai-org/glm-5.3-flash",
+    "ANTHROPIC_SMALL_FAST_MODEL": "zai-org/glm-5.3-flash",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "zai-org/glm-5.3-flash",
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"
+  }
+}

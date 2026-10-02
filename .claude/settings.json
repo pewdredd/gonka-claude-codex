@@ -1,0 +1,21 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+    "API_TIMEOUT_MS": "3000000",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION": "zai-org/glm-5.3-flash",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "GLM-5.3 Flash",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Через GonkaGate, без картинок и WebSearch"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/proxy.py\" --ensure || python3 \"$CLAUDE_PROJECT_DIR/proxy.py\" --ensure"
+          }
+        ]
+      }
+    ]
+  }
+}
