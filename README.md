@@ -21,7 +21,7 @@ MiniMax) к Claude Code и Codex:
 
 ## Подготовка
 
-1. Скачай папку: `git clone https://github.com/pewdredd/gonka-claude` или зелёная кнопка
+1. Скачай папку: `git clone https://github.com/pewdredd/gonka-claude-codex` или зелёная кнопка
    Code → Download ZIP и распаковать.
 2. Скопируй `.env.example` в `.env` и впиши свой ключ: `GONKA_API_KEY=gp-...`.
    Забудешь - `.env` создастся сам при первом запуске, останется вписать ключ.
