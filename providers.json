@@ -1,0 +1,79 @@
+[
+  {
+    "name": "gonkagate",
+    "site": "gonkagate.com",
+    "base_url": "https://api.gonkagate.com/v1",
+    "format": "anthropic",
+    "key_env": "GONKA_API_KEY",
+    "key_env_aliases": [
+      "GONKAGATE_API_KEY"
+    ]
+  },
+  {
+    "name": "gonka.gg",
+    "site": "proxy.gonka.gg",
+    "base_url": "https://api.proxy.gonka.gg/v1",
+    "format": "openai",
+    "key_env": "GONKAGG_API_KEY",
+    "models": {
+      "zai-org/glm-5.3-flash": "zai-org/GLM-5.3-Flash",
+      "deepseek-ai/deepseek-v4-flash-0731": "deepseek-ai/DeepSeek-V4-Flash-0731"
+    }
+  },
+  {
+    "name": "gonka-api",
+    "site": "gonka-api.org",
+    "base_url": "https://api.gonka-api.org/v1",
+    "format": "openai",
+    "key_env": "GONKAAPI_API_KEY",
+    "models": {
+      "zai-org/glm-5.3-flash": "zai-org/GLM-5.3-Flash",
+      "deepseek-ai/deepseek-v4-flash-0731": "deepseek-ai/DeepSeek-V4-Flash-0731"
+    }
+  },
+  {
+    "name": "dahl",
+    "site": "inference.dahl.global",
+    "base_url": "https://inference.dahl.global/v1",
+    "format": "openai",
+    "key_env": "DAHL_API_KEY",
+    "models": {
+      "zai-org/glm-5.3-flash": "zai-org/GLM-5.3-Flash",
+      "deepseek-ai/deepseek-v4-flash-0731": "deepseek-ai/DeepSeek-V4-Flash-0731",
+      "minimaxai/minimax-m2.7": "MiniMaxAI/MiniMax-M2.7"
+    }
+  },
+  {
+    "name": "gonkabroker",
+    "site": "gonkabroker.com",
+    "base_url": "https://proxy.gonkabroker.com/v1",
+    "format": "openai",
+    "key_env": "GONKABROKER_API_KEY",
+    "models": {
+      "zai-org/glm-5.3-flash": "zai-org/GLM-5.3-Flash",
+      "deepseek-ai/deepseek-v4-flash-0731": "deepseek-ai/DeepSeek-V4-Flash-0731"
+    }
+  },
+  {
+    "name": "gonkarouter",
+    "site": "gonkarouter.io",
+    "base_url": "https://api.gonkascan.com/v1",
+    "format": "openai",
+    "key_env": "GONKAROUTER_API_KEY",
+    "models": {
+      "zai-org/glm-5.3-flash": "zai-org/GLM-5.3-Flash",
+      "deepseek-ai/deepseek-v4-flash-0731": "deepseek-ai/DeepSeek-V4-Flash-0731"
+    }
+  },
+  {
+    "name": "gonka24",
+    "site": "gonka24.com",
+    "base_url": "https://api.gonka24.com/v1",
+    "format": "openai",
+    "key_env": "GONKA24_API_KEY",
+    "models": {
+      "zai-org/glm-5.3-flash": "glm-5-3-flash",
+      "deepseek-ai/deepseek-v4-flash-0731": "deepseek-v4-flash"
+    }
+  }
+]

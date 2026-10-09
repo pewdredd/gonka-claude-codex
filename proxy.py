@@ -1,28 +1,34 @@
-"""Прокси Claude Code и Codex -> GonkaGate.
+"""Прокси Claude Code и Codex -> брокеры сети Gonka (GonkaGate, gonka.gg, dahl и другие).
 
-Claude Code. Запросы к моделям GonkaGate (id со слэшем: zai-org/..., deepseek-ai/...,
-minimaxai/...) уходят в шлюз, всё остальное - в Anthropic как есть, с авторизацией
-подписки. Так в /model остаются модели Claude, а модель GonkaGate добавляется к ним.
-Напрямую Claude Code с GonkaGate не работает, шлюз отвечает 400 в двух местах:
-1. Claude Code кладёт в messages сообщения с role "system", а шлюз принимает
+Брокеры. Список - в providers.json, ключи - в .env рядом с этим файлом, у каждого брокера
+своя переменная. Запрос уходит первому живому брокеру с ключом. Лежит, перегружен, завис
+или не принял ключ - запрос сразу уходит следующему. Сломавшегося минуту не трогаем, а тот,
+кто ответил последним, пробуем первым. Отказали все - прокси сам идёт на новый круг через
+2 с, до 5 минут: Claude Code на ошибку отвечает паузой, которая растёт до нескольких минут.
+
+Claude Code. Запросы к моделям Gonka (id со слэшем: zai-org/..., deepseek-ai/...,
+minimaxai/...) уходят брокерам, всё остальное - в Anthropic как есть, с авторизацией
+подписки. Так в /model остаются модели Claude, а модель Gonka добавляется к ним.
+Напрямую Claude Code с брокерами не работает, они отвечают 400 в двух местах:
+1. Claude Code кладёт в messages сообщения с role "system", а брокеры принимают
    только user/assistant. Прокси переносит их в верхнеуровневый system и склеивает
    соседние сообщения одной роли.
-2. Шлюз не понимает lookahead (?! в regex схем инструментов. Прокси выкидывает
+2. Валидатор сети не понимает lookahead (?! в regex схем инструментов. Прокси выкидывает
    из схем строковые pattern.
-Картинки и PDF шлюз тоже не принимает - прокси подменяет их текстовой пометкой.
+Картинки и PDF брокеры тоже не принимают - прокси подменяет их текстовой пометкой.
+Серверные инструменты Anthropic (WebSearch) прокси убирает.
+Большинство брокеров говорит на языке OpenAI ("format": "openai" в providers.json) -
+таким прокси переводит запрос в Chat Completions, а ответ обратно в формат Anthropic.
 
-Codex. Codex говорит только на OpenAI Responses API (/v1/responses), а GonkaGate умеет
+Codex. Codex говорит только на OpenAI Responses API (/v1/responses), а брокеры умеют
 только Chat Completions. Прокси переводит запрос в chat/completions, а стрим ответа
 обратно в события Responses.
-
-Ключ GonkaGate (GONKA_API_KEY) прокси берёт из .env рядом с собой и подставляет в каждый
-запрос к шлюзу.
 
 Руками запускать не нужно: его поднимает хук из .claude/settings.json при старте claude
 и скрипт codex-gonka.cmd / codex-gonka.sh.
   python proxy.py           - запустить в этом окне (видно лог запросов)
-  python proxy.py --ensure  - поднять в фоне, если ещё не запущен
-  python proxy.py --codex   - то же плюс профиль gonka в ~/.codex/config.toml
+  python proxy.py --ensure  - поднять в фоне, если ещё не запущен, лог в proxy.log
+  python proxy.py --codex   - то же плюс профиль gonka в ~/.codex/gonka.config.toml
 """
 import http.client
 import http.server
@@ -32,77 +38,152 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
+from urllib.parse import urlsplit
 
-GONKA = "api.gonkagate.com"
 ANTHROPIC = "api.anthropic.com"
 PORT = int(os.environ.get("GONKA_PROXY_PORT", "8787"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(HERE, ".env")
 ENV_EXAMPLE = os.path.join(HERE, ".env.example")
-GONKA_HEADERS = ("anthropic-version", "anthropic-beta", "content-type")
-# Заглушка из ANTHROPIC_AUTH_TOKEN в режиме «только GonkaGate», см. README.
+PROVIDERS_FILE = os.path.join(HERE, "providers.json")
+LOG_FILE = os.path.join(HERE, "proxy.log")
+# Заглушка из ANTHROPIC_AUTH_TOKEN в режиме «без подписки», см. .claude/gonka-only.json.
 PLACEHOLDER_TOKEN = "key-is-in-.env"
 # Эти заголовки к Anthropic не пересылаем: их выставляет http.client, а сжатый ответ
 # прокси не распаковывает, поэтому просим несжатый.
 SKIP_HEADERS = ("host", "content-length", "connection", "accept-encoding", "keep-alive",
                 "proxy-connection", "transfer-encoding")
 SKIP_RESPONSE_HEADERS = ("transfer-encoding", "connection", "content-length", "content-encoding")
-BUSY_RETRIES, BUSY_DELAY = 40, 3  # повторяем до двух минут (40 x 3 с), пока шлюз занят
+
+COOLDOWN = 60          # сколько секунд не трогать брокера после сбоя
+CONNECT_TIMEOUT = 5    # брокер не принял соединение за 5 с - сразу к следующему
+# Сколько ждать начала ответа. Зависший брокер держит запрос, пока не истечёт это время.
+FIRST_BYTE_TIMEOUT = int(os.environ.get("GONKA_FIRST_BYTE_TIMEOUT", "30"))
+RETRY_FOR = int(os.environ.get("GONKA_RETRY_FOR", "300"))
+RETRY_PAUSE = 2
+# На эти ответы переключаемся на следующего брокера. 400 - ошибка в самом запросе, её отдаём как есть.
+FAILOVER_STATUS = {401, 402, 403, 404, 408, 409, 429} | set(range(500, 600))
+
+state_lock = threading.Lock()
+preferred = None   # имя брокера, который ответил последним
+down_until = {}    # имя брокера -> время, до которого его не трогаем
 
 
-def read_key():
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+# ---------- брокеры ----------
+
+def load_env():
     # Файл читается на каждый запрос: поправил ключ в .env - перезапускать ничего не надо.
+    env = {}
     try:
         with open(ENV_FILE, encoding="utf-8-sig") as f:
             lines = f.read().splitlines()
     except FileNotFoundError:
-        return None
+        lines = []
     for line in lines:
-        name, _, value = line.partition("=")
-        if name.strip() == "GONKA_API_KEY":
-            key = value.strip().strip("\"'")
-            return key if key.startswith("gp-") and key != "gp-..." else None
-    return None
+        name, sep, value = line.partition("=")
+        if sep and not name.strip().startswith("#"):
+            env[name.strip()] = value.strip().strip("\"'")
+    env.update({k: v for k, v in os.environ.items() if k.endswith("_API_KEY")})
+    # Пустое значение или образец вида gp-... - ключа нет.
+    return {k: v for k, v in env.items() if v and not v.endswith("...")}
 
 
-def retry_delay(header):
-    # Retry-After от шлюза уважаем, но не ждём за раз дольше 30 с.
+def load_providers():
+    """Брокеры с ключом, в порядке из providers.json; последний удачный - первым."""
+    env = load_env()
+    with open(PROVIDERS_FILE, encoding="utf-8") as f:
+        listed = json.load(f)
+    providers = []
+    for p in listed:
+        key = next((env[k] for k in [p["key_env"], *p.get("key_env_aliases", [])] if k in env), "")
+        if key and not p.get("disabled"):
+            providers.append({**p, "key": key})
+    with state_lock:
+        now = time.time()
+        providers.sort(key=lambda p: (down_until.get(p["name"], 0) > now, p["name"] != preferred))
+    return providers
+
+
+def mark(name, ok):
+    global preferred
+    with state_lock:
+        if ok:
+            preferred = name
+            down_until.pop(name, None)
+        else:
+            down_until[name] = time.time() + COOLDOWN
+
+
+def model_for(p, model):
+    # У части брокеров свои имена моделей, соответствие - в поле models в providers.json.
+    return p.get("models", {}).get(model, model)
+
+
+def open_upstream(p, method, path, body, headers):
+    """Отправляет запрос брокеру, возвращает (conn, resp). Ошибки сети - исключением."""
+    u = urlsplit(p["base_url"])
+    conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+    conn = conn_cls(u.netloc, timeout=CONNECT_TIMEOUT)
     try:
-        return min(max(float(header), 1), 30)
-    except (TypeError, ValueError):
-        return BUSY_DELAY
-
-
-def gonka_request(method, path, body, headers):
-    # У шлюза лимит одновременных запросов на ключ, и слот освобождается не сразу после
-    # ответа. Codex и Claude Code сдаются раньше, поэтому на 429 ждём и повторяем сами.
-    # Так же повторяем, если шлюз оборвал соединение, не ответив.
-    deadline = time.monotonic() + BUSY_RETRIES * BUSY_DELAY
-    while True:
-        conn = http.client.HTTPSConnection(GONKA, timeout=600)
-        try:
-            conn.request(method, path, body=body, headers=headers)
-            resp = conn.getresponse()
-        except (ConnectionError, socket.gaierror) as e:
-            conn.close()
-            if time.monotonic() >= deadline:
-                raise
-            print(f"GonkaGate не ответил ({e}), повтор через {BUSY_DELAY} с", flush=True)
-            time.sleep(BUSY_DELAY)
-            continue
-        if resp.status != 429 or time.monotonic() >= deadline:
-            return conn, resp
-        delay = retry_delay(resp.getheader("Retry-After"))
-        resp.read()
+        conn.connect()
+        conn.sock.settimeout(FIRST_BYTE_TIMEOUT)
+        conn.request(method, u.path.rstrip("/") + path, body=body, headers={
+            "Authorization": f"Bearer {p['key']}", "x-api-key": p["key"],
+            "Content-Type": "application/json", "User-Agent": "gonka-claude-codex", **headers})
+        resp = conn.getresponse()
+    except (OSError, http.client.HTTPException):
         conn.close()
-        print(f"GonkaGate занят (429), повтор через {delay:g} с", flush=True)
-        time.sleep(delay)
+        raise
+    if conn.sock:
+        conn.sock.settimeout(600)  # заголовки пришли - дальше модель может думать долго
+    return conn, resp
+
+
+def failover(method, build, label):
+    """Отдаёт запрос брокерам по очереди. build(p) -> (path, body, headers) или None, если
+    этому брокеру запрос не отправить. Возвращает (p, conn, resp) первого, кто ответил
+    не сбоем, или (None, None, причины отказа)."""
+    providers = load_providers()
+    deadline = time.monotonic() + RETRY_FOR
+    while True:
+        failures = []
+        for p in providers:
+            req = build(p)
+            if req is None:
+                continue
+            try:
+                conn, resp = open_upstream(p, method, *req)
+            except (OSError, http.client.HTTPException) as e:
+                failures.append(f"{p['name']}: {e}")
+                mark(p["name"], False)
+                log(f"{p['name']} не ответил ({e}), пробую следующего")
+                continue
+            if resp.status in FAILOVER_STATUS:
+                text = resp.read()[:300].decode("utf-8", "replace")
+                conn.close()
+                failures.append(f"{p['name']}: {resp.status} {text}")
+                mark(p["name"], False)
+                log(f"{p['name']} -> {resp.status}, пробую следующего")
+                continue
+            mark(p["name"], resp.status < 400)
+            log(f"{label} -> {p['name']} {resp.status}")
+            return p, conn, resp
+        if not failures or time.monotonic() + RETRY_PAUSE > deadline:
+            return None, None, failures
+        log(f"все брокеры отказали, новый круг через {RETRY_PAUSE} с: " + " | ".join(f[:120] for f in failures))
+        time.sleep(RETRY_PAUSE)
+        providers = load_providers()
 
 
 def is_gonka(model):
-    # У моделей Anthropic в id слэша не бывает, у всех моделей GonkaGate он есть.
+    # У моделей Anthropic в id слэша не бывает, у всех моделей Gonka он есть.
     return isinstance(model, str) and "/" in model
 
 
@@ -121,16 +202,16 @@ def strip_patterns(schema):
 def as_blocks(content):
     if isinstance(content, str):
         return [{"type": "text", "text": content}] if content else []
-    return list(content)
+    return list(content or [])
 
 
 def drop_media(blocks):
-    # Шлюз отвечает 400 на картинки и PDF и роняет весь запрос. Подменяем их текстом,
+    # Брокеры отвечают 400 на картинки и PDF и роняют весь запрос. Подменяем их текстом,
     # чтобы сессия не ломалась, а модель знала, что файл она не видит.
     out = []
     for b in blocks:
         if isinstance(b, dict) and b.get("type") in ("image", "document"):
-            out.append({"type": "text", "text": f"[{b['type']} пропущен: модель через GonkaGate не принимает картинки и PDF]"})
+            out.append({"type": "text", "text": f"[{b['type']} пропущен: модели Gonka не принимают картинки и PDF]"})
             continue
         if isinstance(b, dict) and b.get("type") == "tool_result" and isinstance(b.get("content"), list):
             b = {**b, "content": drop_media(b["content"])}
@@ -142,7 +223,7 @@ def fix_messages(data):
     msgs = data.get("messages")
     if not isinstance(msgs, list):
         return data
-    system = as_blocks(data.get("system") or [])
+    system = as_blocks(data.get("system"))
     fixed = []
     for m in msgs:
         if m.get("role") == "system":
@@ -157,12 +238,190 @@ def fix_messages(data):
         else:
             fixed.append(m)
     data["messages"] = fixed
-    for tool in data.get("tools") or []:
-        if "input_schema" in tool:
-            tool["input_schema"] = strip_patterns(tool["input_schema"])
+    if "tools" in data:
+        # У серверных инструментов (web_search и т. п.) есть поле type - брокеры их не знают.
+        tools = [t for t in data["tools"] if t.get("type") in (None, "custom")]
+        for t in tools:
+            if "input_schema" in t:
+                t["input_schema"] = strip_patterns(t["input_schema"])
+        data["tools"] = tools
+        if not tools:
+            data.pop("tools")
+            data.pop("tool_choice", None)
     if system:
         data["system"] = system
     return data
+
+
+# ---------- Claude Code: перевод Anthropic <-> OpenAI Chat Completions ----------
+
+def block_text(content):
+    if isinstance(content, str):
+        return content
+    return "\n".join(b.get("text", "") for b in content or [] if b.get("type") == "text")
+
+
+def to_openai(body, model):
+    msgs = []
+    if body.get("system"):
+        msgs.append({"role": "system", "content": block_text(body["system"])})
+    for m in body["messages"]:
+        blocks = as_blocks(m["content"])
+        if m["role"] == "assistant":
+            msg = {"role": "assistant", "content": block_text(blocks) or None}
+            calls = [{"id": b["id"], "type": "function",
+                      "function": {"name": b["name"], "arguments": json.dumps(b.get("input", {}), ensure_ascii=False)}}
+                     for b in blocks if b.get("type") == "tool_use"]
+            if calls:
+                msg["tool_calls"] = calls
+            msgs.append(msg)
+            continue
+        # Результаты инструментов - отдельными сообщениями role=tool, сразу после вызова.
+        for b in blocks:
+            if b.get("type") == "tool_result":
+                text = block_text(b.get("content"))
+                msgs.append({"role": "tool", "tool_call_id": b["tool_use_id"],
+                             "content": ("ОШИБКА: " if b.get("is_error") else "") + (text or "(пусто)")})
+        text = block_text([b for b in blocks if b.get("type") == "text"])
+        if text:
+            msgs.append({"role": "user", "content": text})
+
+    out = {"model": model, "messages": msgs, "max_tokens": body.get("max_tokens", 4096),
+           "stream": bool(body.get("stream"))}
+    if out["stream"]:
+        out["stream_options"] = {"include_usage": True}
+    for a, o in (("temperature", "temperature"), ("top_p", "top_p"), ("stop_sequences", "stop")):
+        if a in body:
+            out[o] = body[a]
+    if body.get("tools"):
+        out["tools"] = [{"type": "function", "function": {
+            "name": t["name"], "description": t.get("description", ""),
+            "parameters": t.get("input_schema", {"type": "object"})}} for t in body["tools"]]
+        choice = (body.get("tool_choice") or {}).get("type")
+        if choice == "any":
+            out["tool_choice"] = "required"
+        elif choice == "tool":
+            out["tool_choice"] = {"type": "function", "function": {"name": body["tool_choice"]["name"]}}
+        elif choice == "none":
+            out["tool_choice"] = "none"
+    return out
+
+
+STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use", "function_call": "tool_use"}
+
+
+def starts_in_think(model):
+    # Брокеры с API как у OpenAI присылают рассуждения MiniMax без открывающего <think>,
+    # только с закрывающим. Поэтому ответ MiniMax считаем рассуждением, пока тег не закроется.
+    # Не закрылся - ThinkSplitter отдаст всё текстом, ответ не пропадёт.
+    return "minimax" in model.lower()
+
+
+def without_think(text, model):
+    return "".join(t for think, t in ThinkSplitter(starts_in_think(model)).feed(text, final=True) if not think)
+
+
+def from_openai(data, model):
+    choice = (data.get("choices") or [{}])[0]
+    msg = choice.get("message", {})
+    text = without_think(msg.get("content") or "", model)
+    content = [{"type": "text", "text": text}] if text else []
+    for c in msg.get("tool_calls") or []:
+        try:
+            args = json.loads(c["function"].get("arguments") or "{}")
+        except ValueError:
+            args = {"_raw": c["function"].get("arguments")}
+        content.append({"type": "tool_use", "id": c.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+                        "name": c["function"]["name"], "input": args})
+    u = data.get("usage") or {}
+    return {"id": data.get("id") or f"msg_{uuid.uuid4().hex[:24]}", "type": "message", "role": "assistant",
+            "model": model, "content": content, "stop_sequence": None,
+            "stop_reason": STOP.get(choice.get("finish_reason"), "end_turn"),
+            "usage": {"input_tokens": u.get("prompt_tokens", 0), "output_tokens": u.get("completion_tokens", 0)}}
+
+
+def sse(event, data):
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+def stream_from_openai(resp, model):
+    """Поток Chat Completions -> поток событий Anthropic. Рассуждения MiniMax (<think>) вырезаются."""
+    yield sse("message_start", {"type": "message_start", "message": {
+        "id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message", "role": "assistant", "model": model,
+        "content": [], "stop_reason": None, "stop_sequence": None,
+        "usage": {"input_tokens": 0, "output_tokens": 0}}})
+    index, open_kind, tool_slots = -1, None, {}
+    finish, usage = None, {}
+    think = ThinkSplitter(starts_in_think(model))
+
+    def close():
+        nonlocal open_kind
+        if open_kind:
+            open_kind = None
+            return sse("content_block_stop", {"type": "content_block_stop", "index": index})
+        return b""
+
+    def text_out(text):
+        nonlocal index, open_kind
+        if open_kind != "text":
+            yield close()
+            index += 1
+            open_kind = "text"
+            yield sse("content_block_start", {"type": "content_block_start", "index": index,
+                                              "content_block": {"type": "text", "text": ""}})
+        yield sse("content_block_delta", {"type": "content_block_delta", "index": index,
+                                          "delta": {"type": "text_delta", "text": text}})
+
+    buf = b""
+    while True:
+        chunk = resp.read1(65536)
+        if not chunk:
+            break
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            line = line.strip()
+            if not line.startswith(b"data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == b"[DONE]":
+                continue
+            try:
+                data = json.loads(payload)
+            except ValueError:
+                continue
+            usage = data.get("usage") or usage
+            for ch in data.get("choices") or []:
+                delta = ch.get("delta") or {}
+                finish = ch.get("finish_reason") or finish
+                if delta.get("content"):
+                    for in_think, text in think.feed(delta["content"]):
+                        if not in_think:
+                            yield from text_out(text)
+                for tc in delta.get("tool_calls") or []:
+                    slot = tc.get("index", 0)
+                    if slot not in tool_slots:
+                        yield close()
+                        index += 1
+                        open_kind = "tool"
+                        tool_slots[slot] = index
+                        yield sse("content_block_start", {"type": "content_block_start", "index": index,
+                                  "content_block": {"type": "tool_use", "input": {},
+                                                    "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+                                                    "name": (tc.get("function") or {}).get("name", "")}})
+                    args = (tc.get("function") or {}).get("arguments")
+                    if args:
+                        yield sse("content_block_delta", {"type": "content_block_delta", "index": tool_slots[slot],
+                                                          "delta": {"type": "input_json_delta", "partial_json": args}})
+    for in_think, text in think.feed("", final=True):
+        if not in_think:
+            yield from text_out(text)
+    yield close()
+    yield sse("message_delta", {"type": "message_delta",
+                                "delta": {"stop_reason": STOP.get(finish, "end_turn"), "stop_sequence": None},
+                                "usage": {"input_tokens": usage.get("prompt_tokens", 0),
+                                          "output_tokens": usage.get("completion_tokens", 0)}})
+    yield sse("message_stop", {"type": "message_stop"})
 
 
 # ---------- Codex: Responses -> Chat Completions ----------
@@ -179,7 +438,7 @@ def text_of(content):
         if "text" in c:
             parts.append(c["text"])
         elif c.get("type") in ("input_image", "input_file"):
-            parts.append("[картинка пропущена: модель через GonkaGate не принимает картинки и файлы]")
+            parts.append("[картинка пропущена: модели Gonka не принимают картинки и файлы]")
     return "\n".join(parts)
 
 
@@ -278,8 +537,8 @@ class ThinkSplitter:
 
     OPEN, CLOSE = ("<think>",), ("</think>", "\n\n\n")
 
-    def __init__(self):
-        self.in_think = False
+    def __init__(self, in_think=False):
+        self.in_think = in_think
         self.after_think = False   # сразу после рассуждения срезаем пустые строки
         self.thought = ""          # текущее рассуждение, на случай если оно так и не закроется
         self.pending = ""          # хвост текста, который может оказаться началом тега
@@ -364,7 +623,7 @@ class ResponsesStream:
         self.message = None     # открытое текстовое сообщение: [index, id, text]
         self.calls = {}         # вызовы инструментов по index из стрима
         self.usage = None
-        self.think = ThinkSplitter()
+        self.think = ThinkSplitter(starts_in_think(model))
 
     def on_content(self, delta, final=False):
         for in_think, text in self.think.feed(delta, final):
@@ -504,18 +763,25 @@ class ResponsesStream:
 # ---------- HTTP ----------
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    def send_json(self, status, data):
+    def send_json(self, status, data, headers=None):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def write(self, data):
+        self.wfile.write(data)
+        self.wfile.flush()
+
     def no_key(self, openai=False):
-        msg = f"Нет ключа GonkaGate. Впиши ключ в файл {ENV_FILE}: GONKA_API_KEY=gp-... и повтори запрос."
+        msg = f"Нет ни одного ключа брокера. Впиши ключ в файл {ENV_FILE} (список брокеров - providers.json) и повтори запрос."
         if openai:
             return self.send_json(401, {"error": {"type": "invalid_request_error", "code": "no_key", "message": msg}})
+        # 400, а не 401: на 401 Claude Code молча повторяет запрос и висит.
         self.send_json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": msg}})
 
     def start_stream(self, resp):
@@ -523,42 +789,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         for k, v in resp.getheaders():
             if k.lower() not in SKIP_RESPONSE_HEADERS:
                 self.send_header(k, v)
+        # Длину заранее не знаем (стриминг), поэтому конец ответа = закрытие соединения.
         self.send_header("Connection", "close")
         self.end_headers()
 
-    def pipe(self, host, method, body, headers):
-        if host == GONKA:
-            conn, resp = gonka_request(method, self.path, body, headers)
-        else:
-            conn = http.client.HTTPSConnection(host, timeout=600)
-            conn.request(method, self.path, body=body, headers=headers)
-            resp = conn.getresponse()
+    def pipe(self, resp):
         self.start_stream(resp)
-
-        def write(data):
-            self.wfile.write(data)
-            self.wfile.flush()
-
-        answer = host == GONKA and resp.status == 200 and self.path.startswith("/v1/messages") \
-            and "count_tokens" not in self.path
-        if answer and "text/event-stream" in (resp.getheader("Content-Type") or ""):
-            strip_think_sse(resp, write)
-        elif answer:
-            write(strip_think_json(resp.read()))
-        else:
-            while chunk := resp.read1(8192):
-                write(chunk)
-        conn.close()
-
-    def gonka_headers(self, key):
-        headers = {k: v for k, v in self.headers.items() if k.lower() in GONKA_HEADERS}
-        headers["Authorization"] = f"Bearer {key}"
-        return headers
+        while True:
+            chunk = resp.read1(8192)
+            if not chunk:
+                break
+            self.write(chunk)
 
     def forward(self, method):
         body = None
         if method == "POST":
-            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         if self.path.startswith("/v1/responses"):
             return self.codex(body)
         data = None
@@ -566,44 +812,111 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data = json.loads(body)
         auth = self.headers.get("Authorization", "")
         model = data.get("model") if data else None
-        to_gonka = is_gonka(model) if model else auth == f"Bearer {PLACEHOLDER_TOKEN}"
+        # Без модели в запросе (GET /v1/models) смотрим на авторизацию: подписка Claude
+        # всегда её шлёт, а режим без подписки и curl из терминала - нет или заглушку.
+        to_gonka = is_gonka(model) if model else auth in ("", f"Bearer {PLACEHOLDER_TOKEN}")
         if not to_gonka:
             # Модель Claude: пересылаем в Anthropic как есть, с авторизацией подписки.
             headers = {k: v for k, v in self.headers.items() if k.lower() not in SKIP_HEADERS}
-            return self.pipe(ANTHROPIC, method, body, headers)
-        key = read_key()
-        if not key:
+            conn = http.client.HTTPSConnection(ANTHROPIC, timeout=600)
+            conn.request(method, self.path, body=body, headers=headers)
+            self.pipe(conn.getresponse())
+            return conn.close()
+        if not load_providers():
             return self.no_key()
-        if data:
-            body = json.dumps(fix_messages(data), ensure_ascii=False).encode("utf-8")
-        self.pipe(GONKA, method, body, self.gonka_headers(key))
+        self.gonka(method, fix_messages(data) if data else None, body)
+
+    def gonka(self, method, data, raw):
+        sub = self.path[3:] if self.path.startswith("/v1/") else self.path
+        route = sub.split("?")[0]
+        if route == "/messages/count_tokens":
+            # Подсчёт есть не у всех брокеров, а 404 на нём уронил бы брокера в «сломанные».
+            # Claude Code хватает оценки.
+            return self.send_json(200, {"input_tokens": len(raw or b"") // 4})
+        model = (data or {}).get("model", "")
+        passed = {k: v for k, v in self.headers.items() if k.lower() in ("anthropic-version", "anthropic-beta")}
+        passed.setdefault("anthropic-version", "2023-06-01")
+
+        def build(p):
+            openai = p.get("format") == "openai"
+            if data is None:
+                return sub, raw, {} if openai else passed
+            target = model_for(p, model)
+            if openai and route == "/messages":
+                return "/chat/completions", json.dumps(to_openai(data, target), ensure_ascii=False).encode("utf-8"), {}
+            return sub, json.dumps({**data, "model": target}, ensure_ascii=False).encode("utf-8"), passed
+
+        p, conn, resp = failover(method, build, f"{route} {model}".strip())
+        if not p:
+            log("все брокеры отказали: " + " | ".join(resp))
+            # 529 - «перегружено». retry-after просит Claude Code повторить через секунду,
+            # а не ждать по нарастающей до нескольких минут.
+            return self.send_json(529, {"type": "error", "error": {
+                "type": "overloaded_error", "message": "Все брокеры недоступны: " + " | ".join(resp)}},
+                {"retry-after": "1", "retry-after-ms": "1000", "x-should-retry": "true"})
+        try:
+            openai = p.get("format") == "openai"
+            if route != "/messages":
+                self.pipe(resp)
+            elif openai and resp.status == 200 and data.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                for part in stream_from_openai(resp, model):
+                    if part:
+                        self.write(part)
+            elif openai and resp.status == 200:
+                self.send_json(200, from_openai(json.loads(resp.read()), model))
+            elif openai:
+                text = resp.read()[:500].decode("utf-8", "replace")
+                self.send_json(resp.status, {"type": "error", "error": {
+                    "type": "invalid_request_error", "message": f"{p['name']}: {text}"}})
+            elif resp.status == 200 and "text/event-stream" in (resp.getheader("Content-Type") or ""):
+                self.start_stream(resp)
+                strip_think_sse(resp, self.write)
+            elif resp.status == 200:
+                self.start_stream(resp)
+                self.write(strip_think_json(resp.read()))
+            else:
+                self.pipe(resp)
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            log(f"{p['name']}: обрыв посреди ответа: {e}")
+        finally:
+            conn.close()
 
     def codex(self, body):
-        key = read_key()
-        if not key:
+        if not load_providers():
             return self.no_key(openai=True)
         req = json.loads(body)
         chat, custom = responses_to_chat(req)
-        conn, resp = gonka_request("POST", "/v1/chat/completions", json.dumps(chat, ensure_ascii=False).encode("utf-8"),
-                                   {"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
-        if resp.status != 200:
-            # Ошибку отдаём как есть: на 5xx Codex сам повторит запрос.
-            self.start_stream(resp)
-            self.wfile.write(resp.read())
+
+        def build(p):
+            return "/chat/completions", json.dumps({**chat, "model": model_for(p, req["model"])},
+                                                   ensure_ascii=False).encode("utf-8"), {}
+
+        p, conn, resp = failover("POST", build, f"/responses {req['model']}")
+        if not p:
+            log("все брокеры отказали: " + " | ".join(resp))
+            # На 5xx Codex сам повторит запрос.
+            return self.send_json(503, {"error": {"type": "server_error", "code": "brokers_down",
+                                                  "message": "Все брокеры недоступны: " + " | ".join(resp)}})
+        try:
+            if resp.status != 200:
+                # Ошибку отдаём как есть.
+                self.start_stream(resp)
+                self.write(resp.read())
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            ResponsesStream(self.write, req["model"], custom).run(resp)
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            log(f"{p['name']}: обрыв посреди ответа: {e}")
+        finally:
             conn.close()
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
-
-        def write(data):
-            self.wfile.write(data)
-            self.wfile.flush()
-
-        ResponsesStream(write, req["model"], custom).run(resp)
-        conn.close()
 
     def do_POST(self):
         self.forward("POST")
@@ -617,12 +930,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.forward("GET")
 
     def do_HEAD(self):
-        # Claude Code проверяет связь HEAD-запросом; апстрим не трогаем.
+        # Claude Code проверяет связь HEAD-запросом; брокеров не трогаем.
         self.send_response(200)
         self.end_headers()
 
     def log_message(self, fmt, *args):
-        print(self.address_string(), fmt % args, flush=True)
+        pass  # свой лог - в log(): какой брокер ответил на какой запрос
 
 
 def is_running():
@@ -641,13 +954,16 @@ def ensure():
     if os.name == "nt" and python.lower().endswith("python.exe"):
         pythonw = python[:-10] + "pythonw.exe"
         python = pythonw if os.path.exists(pythonw) else python
-    kwargs = {"cwd": HERE, "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
-              "stderr": subprocess.DEVNULL}
-    if os.name == "nt":
-        kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        kwargs["start_new_session"] = True
-    subprocess.Popen([python, os.path.abspath(__file__)], **kwargs)
+    # Лог начинаем заново, если он разросся больше мегабайта.
+    mode = "w" if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 1_000_000 else "a"
+    with open(LOG_FILE, mode, encoding="utf-8") as logf:
+        kwargs = {"cwd": HERE, "stdin": subprocess.DEVNULL, "stdout": logf, "stderr": logf,
+                  "env": {**os.environ, "PYTHONIOENCODING": "utf-8"}}
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen([python, os.path.abspath(__file__)], **kwargs)
     for _ in range(50):
         if is_running():
             return
@@ -662,13 +978,13 @@ def install_codex():
     # моделей поменяется, если папку перенесли.
     home = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
     catalog = os.path.join(HERE, "codex-models.json").replace("\\", "/")
-    text = ("# Codex через GonkaGate: codex --profile gonka.\n"
+    text = ("# Codex через сеть Gonka: codex --profile gonka.\n"
             f"# Файл пишет {os.path.join(HERE, 'proxy.py')} при каждом запуске codex-gonka, правки затрутся.\n"
             'model_provider = "gonka"\n'
             'model = "zai-org/glm-5.3-flash"\n'
             f"model_catalog_json = '{catalog}'\n\n"
             "[model_providers.gonka]\n"
-            'name = "GonkaGate"\n'
+            'name = "Gonka"\n'
             f'base_url = "http://127.0.0.1:{PORT}/v1"\n'
             'wire_api = "responses"\n')
     os.makedirs(home, exist_ok=True)
@@ -683,5 +999,6 @@ if __name__ == "__main__":
     elif "--ensure" in sys.argv:
         ensure()
     else:
-        print(f"GonkaGate proxy: http://127.0.0.1:{PORT} -> {GONKA} / {ANTHROPIC}", flush=True)
+        names = [p["name"] for p in load_providers()]
+        print(f"Прокси Gonka: http://127.0.0.1:{PORT}, брокеры с ключом: {', '.join(names) or 'нет'}", flush=True)
         http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
