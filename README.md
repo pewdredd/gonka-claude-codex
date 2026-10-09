@@ -1,7 +1,7 @@
-# Claude Code, Codex и OpenCode на сети Gonka
+# OpenCode, Claude Code и Codex на сети Gonka
 
-Подключает дешёвые модели сети Gonka - GLM, DeepSeek, MiniMax - к Claude Code, Codex и OpenCode.
-Нужны только Python и ключ хотя бы одного брокера.
+Подключает дешёвые модели сети Gonka - GLM, DeepSeek, MiniMax - к OpenCode, Claude Code и Codex.
+Нужен только ключ хотя бы одного брокера. Для Claude Code и Codex - ещё Python.
 
 Работает только внутри этой папки. В остальных папках `claude` и `codex` остаются обычными,
 подписка и настройки не трогаются.
@@ -23,15 +23,16 @@
 
 | Режим | Когда подходит | Команда |
 |---|---|---|
+| OpenCode | Самый простой путь: без прокси и без Python | `opencode` |
 | Claude Code + подписка | Есть подписка Claude, нужна дешёвая модель рядом | `claude` |
 | Claude Code без подписки | Подписки нет | `claude --settings .claude/gonka-only.json` |
 | Codex | Codex на моделях Gonka вместо GPT | `./codex-gonka.sh` или `.\codex-gonka.cmd` |
-| OpenCode | OpenCode на моделях Gonka, прокси не нужен | `opencode` |
 
 ## Что нужно
 
-- [Claude Code](https://docs.claude.com/en/docs/claude-code/setup), [Codex CLI](https://developers.openai.com/codex/cli) или [OpenCode](https://opencode.ai)
-- Python 3.8+ (для OpenCode не нужен). Проверка:
+- [OpenCode](https://opencode.ai), [Claude Code](https://docs.claude.com/en/docs/claude-code/setup) или [Codex CLI](https://developers.openai.com/codex/cli)
+- Ключ хотя бы одного брокера, см. «Брокеры» выше
+- Для Claude Code и Codex - Python 3.8+. Проверка:
 
   ```
   python --version
@@ -43,11 +44,7 @@
   winget install Python.Python.3.12
   ```
 
-- Ключ хотя бы одного брокера, см. «Брокеры» выше
-
-## Установка
-
-**1. Скачайте папку**
+## Скачать папку
 
 ```
 git clone https://github.com/pewdredd/gonka-claude-codex
@@ -59,7 +56,58 @@ cd gonka-claude-codex
 
 Без git: на GitHub нажмите **Code → Download ZIP**, распакуйте и откройте терминал в этой папке.
 
-**2. Создайте файл `.env` из шаблона**
+## OpenCode
+
+OpenCode сам говорит на языке брокеров, поэтому подключается к ним напрямую - без прокси и без Python.
+Нужен один файл `opencode.json` из этой папки.
+
+**1. Скачайте папку** - см. «Скачать папку» выше.
+
+**2. Положите `opencode.json`** в одно из двух мест:
+
+- в папку своего проекта - модели Gonka будут только там;
+- в `~/.config/opencode/opencode.json` (на Windows `C:\Users\ИМЯ\.config\opencode\opencode.json`) -
+  модели Gonka будут везде. Если там уже есть свой файл, перенесите в него блок `"provider"`.
+
+**3. Задайте ключ.** OpenCode берёт ключ из переменной окружения, файл `.env` он не читает.
+Выполните перед запуском, в том же окне терминала.
+
+Mac и Linux:
+
+```
+export DAHL_API_KEY="ваш-ключ"
+```
+
+Windows (PowerShell):
+
+```
+$env:DAHL_API_KEY = "ваш-ключ"
+```
+
+Для proxy.gonka.gg переменная называется `GONKAGG_API_KEY`.
+
+**4. Запустите** в папке проекта:
+
+```
+opencode
+```
+
+По умолчанию стоит GLM 5.3 Flash через dahl. Другая модель - команда `/models` внутри OpenCode
+или флаг при запуске:
+
+```
+opencode -m dahl/MiniMaxAI/MiniMax-M2.7
+```
+
+Если модель отвечает «at concurrency capacity» - бесплатных пользователей брокер пускает в последнюю
+очередь. Выберите другую модель через `/models` или подождите.
+
+## Claude Code
+
+Claude Code не умеет говорить с брокерами напрямую, поэтому между ними стоит прокси `proxy.py`.
+Он запускается сам при старте `claude` и берёт ключи из файла `.env`.
+
+**1. Создайте файл `.env` из шаблона**
 
 Windows:
 
@@ -75,23 +123,24 @@ cp .env.example .env
 
 Если пропустить этот шаг, `.env` создастся сам при первом запуске.
 
-**3. Впишите ключ** в `.env` - в строку своего брокера, например:
+**2. Впишите ключ** в `.env` - в строку своего брокера, например:
 
 ```
 DAHL_API_KEY=ваш-ключ
 ```
 
-Файл `.env` не попадает в git.
+Файл `.env` не попадает в git. Codex берёт ключи из того же файла.
 
-**4. Запустите нужный режим** - см. ниже.
+**3. Запустите** - с подпиской или без, см. ниже.
 
-## Claude Code с подпиской
+### С подпиской
 
 ```
 claude
 ```
 
-При первом запуске Claude Code спросит, доверяете ли вы папке. Ответьте «да» - иначе прокси не запустится.
+При первом запуске Claude Code спросит, доверяете ли вы папке. По умолчанию выделено «No, exit» -
+выберите стрелкой «Yes, I trust this folder», иначе Claude Code закроется, а прокси не запустится.
 
 Откройте `/model`: к обычным моделям Claude добавится **GLM-5.3 Flash**. Выбрали её - запросы идут
 в сеть Gonka. Вернулись на Opus или Sonnet - снова по подписке. Переключаться можно посреди разговора.
@@ -112,7 +161,7 @@ claude
 Claude Code предупредит, что не знает эти модели, и будет считать контекст в 200k токенов.
 Это нормально: у GLM и DeepSeek контекст 400k, просто сжатие диалога начнётся раньше.
 
-## Claude Code без подписки
+### Без подписки
 
 ```
 claude --settings .claude/gonka-only.json
@@ -122,6 +171,8 @@ claude --settings .claude/gonka-only.json
 Чтобы работать на другой модели, замените `zai-org/glm-5.3-flash` в `.claude/gonka-only.json`.
 
 ## Codex
+
+Сначала создайте `.env` и впишите ключ - шаги 1-2 из раздела «Claude Code».
 
 Mac и Linux:
 
@@ -161,61 +212,17 @@ Windows:
 Просто `codex` в папке не сработает: Codex разрешает задавать провайдера моделей только
 из `~/.codex`, а не из папки проекта.
 
-## OpenCode
-
-OpenCode сам говорит на языке брокеров, поэтому подключается к ним напрямую - без прокси и без Python.
-Нужен один файл `opencode.json` из этой папки.
-
-**1. Положите `opencode.json`** в одно из двух мест:
-
-- в папку своего проекта - модели Gonka будут только там;
-- в `~/.config/opencode/opencode.json` (на Windows `C:\Users\ИМЯ\.config\opencode\opencode.json`) -
-  модели Gonka будут везде. Если там уже есть свой файл, перенесите в него блок `"provider"`.
-
-**2. Задайте ключ.** OpenCode берёт ключ из переменной окружения, файл `.env` он не читает.
-Выполните перед запуском, в том же окне терминала.
-
-Mac и Linux:
-
-```
-export DAHL_API_KEY="ваш-ключ"
-```
-
-Windows (PowerShell):
-
-```
-$env:DAHL_API_KEY = "ваш-ключ"
-```
-
-Для proxy.gonka.gg переменная называется `GONKAGG_API_KEY`.
-
-**3. Запустите** в папке проекта:
-
-```
-opencode
-```
-
-По умолчанию стоит GLM 5.3 Flash через dahl. Другая модель - команда `/models` внутри OpenCode
-или флаг при запуске:
-
-```
-opencode -m dahl/MiniMaxAI/MiniMax-M2.7
-```
-
-Если модель отвечает «at concurrency capacity» - бесплатных пользователей брокер пускает в последнюю
-очередь. Выберите другую модель через `/models` или подождите.
-
 ## Ограничения
 
 Claude Code и Codex проверены 2026-10-02 на всех трёх моделях. 2026-10-09 - на MiniMax M2.7
-(Claude Code 2.1.286, Codex 0.154.0, OpenCode 1.18.35): GLM и DeepSeek в тот день были перегружены у всех брокеров.
+(OpenCode 1.18.35, Claude Code 2.1.286, Codex 0.154.0): GLM и DeepSeek в тот день были перегружены у всех брокеров.
 
-| | Claude Code | Codex | OpenCode |
+| | OpenCode | Claude Code | Codex |
 |---|---|---|---|
-| GLM, DeepSeek, MiniMax | да | да | MiniMax - да, GLM и DeepSeek не проверены |
-| Модели Claude по подписке рядом с ними | да | - | - |
+| GLM, DeepSeek, MiniMax | MiniMax - да, GLM и DeepSeek не проверены | да | да |
+| Модели Claude по подписке рядом с ними | - | да | - |
 | Чтение и правка файлов, команды в терминале | да | да | да |
-| Автопереключение между брокерами | да | да | нет |
+| Автопереключение между брокерами | нет | да | да |
 | WebSearch | нет | нет | нет |
 | Картинки и PDF | нет | нет | нет |
 
